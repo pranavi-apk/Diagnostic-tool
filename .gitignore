@@ -1,0 +1,21 @@
+# STM32CubeIDE / GCC build
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+
+# IDE / OS
+.DS_Store
+*.bak
+*~
+
+# Local secrets (none expected; keep habit)
+.env
+.env.*
