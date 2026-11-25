@@ -7,6 +7,8 @@
 #include "sw_i2c.h"
 #include "i2c_scanner.h"
 #include "diag_iface.h"
+#include "uart_cmd.h"
+#include "dc_probe.h"
 #include <stdint.h>
 #include <stdio.h>
 /* =========================================================
@@ -69,7 +71,7 @@ static uint8_t Analyzer_UiValuesChanged(uint8_t have,
 }
 
 /* USART1 UART terminal: PA9 TX, PA10 RX, 115200 baud */
-static char uart_rx_line[32];
+static char uart_rx_line[80];
 static uint8_t uart_rx_length = 0U;
 static uint8_t uart_line_ready = 0U;
 static uint8_t uart_display_dirty = 0U;
@@ -99,6 +101,8 @@ static uint8_t BME280_Init_SoftwareI2C(void);
 static uint8_t BME280_ReadMeasurements(float *temperature,
                                        float *pressure,
                                        float *humidity);
+static void Host_UartPwmSet(uint32_t freq_hz, uint8_t duty_percent, int8_t output_on);
+static uint8_t Host_UartEnvRead(float *temp_c, float *press_pa, float *humidity_rh);
 static void LCD_Show_Environment_Screen(void);
 static void LCD_Update_Environment_Screen(void);
 /* =========================================================
@@ -113,8 +117,10 @@ static const char *menu_options[MENU_ITEMS] =
     "I2C SCANNER",
     "ENV MONITOR",
     "UART TERMINAL",
-    "SYSTEM INFO"
+    "DC PROBE"
 };
+static uint32_t probe_slow_tick = 0U;
+static uint32_t probe_card_tick = 0U;
 static int8_t menu_selection = 0;
 static int32_t previous_encoder_count = 0;
 static uint8_t screen_mode = 0;
@@ -170,6 +176,9 @@ static void LCD_Handle_Menu(void);
 static void Screen_Begin(const char *title);
 static void Screen_Footer(void);
 static void Dashboard_DrawOneSelection(int8_t selection, uint8_t selected);
+static void LCD_Show_Dc_Probe(void);
+static void LCD_Update_Dc_Probe(void);
+static void DcProbe_ServiceTick(void);
 /* =========================================================
    MAIN FUNCTION
    ========================================================= */
@@ -185,7 +194,11 @@ int main(void)
     PWM_Init();
     SignalAnalyzer_Init();
     SwI2c_InitPins();
+    DcProbe_Init();
     UART_Init();
+    HAL_Delay(80);
+    UART_SendString("\r\n=== DIAG UART (115200) ===\r\n");
+    UART_SendString("Enter HELP then Return\r\n> ");
     previous_encoder_count = encoder_count;
     LCD_Show_Main_Menu();
     while (1)
@@ -193,6 +206,7 @@ int main(void)
         Encoder_Update();
         UART_Process();
         SignalAnalyzer_Tick();
+        DcProbe_ServiceTick();
         if (I2cScanner_IsBusy())
         {
             I2cScanner_Tick();
@@ -408,18 +422,36 @@ static const char *Analyzer_VerdictText(MeasureVerdict v)
     }
 }
 
-/* Draw N square-wave cycles from measured duty. Title band is reserved. */
-static void Analyzer_DrawSquareCycles(uint16_t x, uint16_t y,
-                                      uint16_t w, uint16_t h,
-                                      const char *title,
-                                      uint16_t wave_color,
-                                      uint32_t duty_percent,
-                                      uint8_t cycles,
-                                      uint8_t have_signal)
+/* sin(2*pi*i/64) * 100 — full period; index 63 and 0 both ~0 for smooth wrap. */
+static const int8_t ANALYZER_SIN_Q100[64] = {
+     0,  10,  20,  29,  38,  47,  56,  63,  71,  77,  83,  88,  92,  96,  98, 100,
+   100, 100,  98,  96,  92,  88,  83,  77,  71,  63,  56,  47,  38,  29,  20,  10,
+     0, -10, -20, -29, -38, -47, -56, -63, -71, -77, -83, -88, -92, -96, -98,-100,
+  -100,-100, -98, -96, -92, -88, -83, -77, -71, -63, -56, -47, -38, -29, -20, -10
+};
+
+static int16_t analyzer_sin_interp_q100(uint16_t phase_q8)
+{
+    uint8_t idx = (uint8_t)((phase_q8 >> 8) & 63U);
+    uint8_t frac = (uint8_t)(phase_q8 & 0xFFU);
+    int16_t a = (int16_t)ANALYZER_SIN_Q100[idx];
+    int16_t b = (int16_t)ANALYZER_SIN_Q100[(uint8_t)((idx + 1U) & 63U)];
+
+    return (int16_t)(a + (int16_t)(((int32_t)(b - a) * (int32_t)frac) >> 8));
+}
+
+/* Draw N sine cycles (display only). Title band is reserved. */
+static void Analyzer_DrawSineCycles(uint16_t x, uint16_t y,
+                                    uint16_t w, uint16_t h,
+                                    const char *title,
+                                    uint16_t wave_color,
+                                    uint32_t duty_percent,
+                                    uint8_t cycles,
+                                    uint8_t have_signal)
 {
     const uint16_t bg = 0x0862U;
     const uint16_t frame = 0x2945U;
-    const uint16_t title_h = 18U; /* keep wave below "WAVEFORM" / "FREQ TREND" */
+    const uint16_t title_h = 18U;
     uint16_t plot_y = (uint16_t)(y + title_h);
     uint16_t plot_h = (uint16_t)(h - title_h);
     uint16_t y_high = (uint16_t)(plot_y + 4U);
@@ -427,10 +459,12 @@ static void Analyzer_DrawSquareCycles(uint16_t x, uint16_t y,
     uint16_t x0 = (uint16_t)(x + 6U);
     uint16_t x1 = (uint16_t)(x + w - 7U);
     uint16_t usable;
-    uint16_t period_w;
-    uint16_t high_w;
-    uint8_t c;
-    uint16_t cx;
+    uint16_t y_mid;
+    uint16_t y_amp;
+    uint16_t px;
+    uint16_t py_prev = 0U;
+    uint16_t py;
+    uint8_t first = 1U;
 
     if (cycles == 0U)
     {
@@ -454,15 +488,11 @@ static void Analyzer_DrawSquareCycles(uint16_t x, uint16_t y,
     }
 
     usable = (uint16_t)(x1 - x0);
-    period_w = (uint16_t)(usable / cycles);
-    if (period_w < 4U)
+    y_mid = (uint16_t)((y_high + y_low) / 2U);
+    y_amp = (uint16_t)((y_low - y_high) / 2U);
+    if (y_amp < 2U)
     {
-        period_w = 4U;
-        cycles = (uint8_t)(usable / period_w);
-        if (cycles < 1U)
-        {
-            cycles = 1U;
-        }
+        y_amp = 2U;
     }
 
     if (have_signal == 0U)
@@ -482,42 +512,47 @@ static void Analyzer_DrawSquareCycles(uint16_t x, uint16_t y,
         return;
     }
 
-    high_w = (uint16_t)(((uint32_t)period_w * duty_percent) / 100U);
-    if (high_w < 1U)
+    /* Scale peak slightly with duty so 50% is full sine, extremes flatten. */
+    y_amp = (uint16_t)((y_amp * duty_percent) / 50U);
+    if (y_amp < 2U)
     {
-        high_w = 1U;
+        y_amp = 2U;
     }
-    if (high_w >= period_w)
+    if (y_amp > (uint16_t)((y_low - y_high) / 2U))
     {
-        high_w = (uint16_t)(period_w - 1U);
+        y_amp = (uint16_t)((y_low - y_high) / 2U);
     }
 
-    cx = x0;
-    for (c = 0U; c < cycles; c++)
+    /*
+     * Phase Q8: (0 .. cycles*64*256) across the plot width — interpolate LUT so
+     * multi-cycle traces (FREQ TREND) stay smooth at period boundaries.
+     */
+    for (px = x0; px <= x1; px++)
     {
-        uint16_t edge = (uint16_t)(cx + high_w);
-        uint16_t next = (uint16_t)(cx + period_w);
+        uint32_t numer = (uint32_t)(px - x0) * (uint32_t)cycles * 16384U;
+        uint16_t phase_q8 = (uint16_t)(numer / usable);
+        int32_t sin_q100 = (int32_t)analyzer_sin_interp_q100(phase_q8);
+        int32_t yy = (int32_t)y_mid - (sin_q100 * (int32_t)y_amp) / 100;
 
-        if (next > x1)
+        if (yy < (int32_t)y_high)
         {
-            next = x1;
+            yy = (int32_t)y_high;
         }
-        if (edge > next)
+        if (yy > (int32_t)y_low)
         {
-            edge = next;
+            yy = (int32_t)y_low;
         }
+        py = (uint16_t)yy;
 
-        /* Rising edge → high → falling → low (one period). */
-        LCD_DrawLine(cx, y_low, cx, y_high, wave_color);
-        LCD_DrawLine(cx, y_high, edge, y_high, wave_color);
-        LCD_DrawLine(edge, y_high, edge, y_low, wave_color);
-        LCD_DrawLine(edge, y_low, next, y_low, wave_color);
-
-        cx = next;
-        if (cx >= x1)
+        if (first == 0U)
         {
-            break;
+            LCD_DrawLine((uint16_t)(px - 1U), py_prev, px, py, wave_color);
         }
+        else
+        {
+            first = 0U;
+        }
+        py_prev = py;
     }
 }
 
@@ -526,18 +561,18 @@ static void Analyzer_DrawWaveform(uint16_t x, uint16_t y,
                                   uint32_t duty_percent,
                                   uint8_t have_signal)
 {
-    Analyzer_DrawSquareCycles(x, y, w, h, "WAVEFORM", 0x07FFU,
+    Analyzer_DrawSineCycles(x, y, w, h, "WAVEFORM", 0x07FFU,
                               duty_percent, 1U, have_signal);
 }
 
-/* Multi-cycle square wave (min 6 periods) so peak and base are clear. */
+/* Multi-cycle sine (6 periods) for frequency trend band. */
 static void Analyzer_DrawFreqTrend(uint16_t x, uint16_t y,
                                    uint16_t w, uint16_t h,
                                    uint32_t duty_percent,
                                    uint8_t have_signal)
 {
-    Analyzer_DrawSquareCycles(x, y, w, h, "FREQ TREND", 0x07E0U,
-                              duty_percent, 6U, have_signal);
+    Analyzer_DrawSineCycles(x, y, w, h, "FREQ TREND", 0x07E0U,
+                            duty_percent, 6U, have_signal);
 }
 
 static void LCD_Show_Signal_Analyzer(void)
@@ -630,7 +665,12 @@ static void UART_Init(void)
     USART1->CR2 = 0U;       /* 1 stop bit */
     USART1->CR3 = 0U;
     USART1->BRR = 625U;     /* 72 MHz PCLK2 / 115200 baud */
-    USART1->CR1 = (1U << 13) | (1U << 3) | (1U << 2); /* UE, TE, RE */
+    USART1->CR1 = (1U << 13) | (1U << 3) | (1U << 2) | (1U << 5); /* UE, TE, RE, RXNEIE */
+
+    HAL_NVIC_SetPriority(USART1_IRQn, 2U, 0U);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
+
+    UartCmd_Init(UART_SendString, Host_UartPwmSet, Host_UartEnvRead);
 }
 
 static void UART_SendString(const char *text)
@@ -657,15 +697,16 @@ static void LCD_Update_UART_RX_Line(void)
 
 static void LCD_Update_UART_Terminal(void)
 {
-    char line[32];
+    char line[40];
 
     LCD_SetTextColors(0xE71CU, 0x10E5U);
-    LCD_DrawString(16, 52, "BAUD: 115200  8-N-1");
-    LCD_DrawString(16, 84, "USB SERIAL: READY");
-    LCD_DrawString(16, 124, "LAST RX:");
-    snprintf(line, sizeof(line), "%-29.29s", uart_rx_line);
+    LCD_DrawString(16, 52, "HOST CMD  115200 8-N-1");
+    LCD_DrawString(16, 84, "TRY: HELP STATUS GET_PWM");
+    LCD_DrawString(16, 124, "LAST CMD:");
+    snprintf(line, sizeof(line), "%-33.33s", uart_rx_line);
     LCD_DrawString(16, 156, line);
-    LCD_DrawString(16, 188, "TYPE IN MAC TERMINAL");
+    snprintf(line, sizeof(line), "%-33.33s", UartCmd_LastStatusLine());
+    LCD_DrawString(16, 188, line);
 }
 
 static void LCD_Show_UART_Terminal(void)
@@ -675,55 +716,201 @@ static void LCD_Show_UART_Terminal(void)
     uart_rx_length = 0U;
     uart_line_ready = 0U;
     LCD_Update_UART_Terminal();
-    UART_SendString("\r\nSTM32 UART READY - 115200 baud\r\n");
-    UART_SendString("Type a message and press Enter.\r\n> ");
+    UART_SendString("\r\nDIAG UART CMD PROTOCOL 115200\r\n");
+    UART_SendString("Type HELP then Enter.\r\n> ");
     screen_mode = 1U;
 }
 
-static void UART_Process(void)
+static void UART_Rx_OnByte(char ch)
 {
-    while ((USART1->SR & (1U << 5)) != 0U) /* RXNE */
+    if ((ch == '\r') || (ch == '\n'))
     {
-        char ch = (char)(USART1->DR & 0xFFU);
-
-        /* Echo received characters back to the Mac terminal. */
-        while ((USART1->SR & (1U << 7)) == 0U) { }
-        USART1->DR = (uint8_t)ch;
-
-        if ((ch == '\r') || (ch == '\n'))
+        if (uart_rx_length > 0U)
         {
-            if (uart_rx_length > 0U)
-            {
-                uart_rx_line[uart_rx_length] = '\0';
-                uart_line_ready = 1U;
-                uart_display_dirty = 1U;
-                uart_rx_length = 0U;
-                UART_SendString("\r\nSTM32 received your message.\r\n> ");
-            }
+            uart_rx_line[uart_rx_length] = '\0';
+            uart_line_ready = 1U;
+            uart_display_dirty = 1U;
         }
-        else if ((ch == '\b') || (ch == 127))
+        else
         {
-            if (uart_rx_length > 0U)
-            {
-                uart_rx_length--;
-                uart_rx_line[uart_rx_length] = '\0';
-                uart_display_dirty = 1U;
-            }
+            UART_SendString("\r\n> ");
         }
-        else if ((ch >= 32) && (ch <= 126) &&
-                 (uart_rx_length < (sizeof(uart_rx_line) - 1U)))
+    }
+    else if ((ch == '\b') || (ch == 127))
+    {
+        if (uart_rx_length > 0U)
         {
-            uart_rx_line[uart_rx_length++] = ch;
+            uart_rx_length--;
             uart_rx_line[uart_rx_length] = '\0';
             uart_display_dirty = 1U;
         }
     }
+    else if ((ch >= 32) && (ch <= 126) &&
+             (uart_rx_length < (sizeof(uart_rx_line) - 1U)))
+    {
+        uart_rx_line[uart_rx_length++] = ch;
+        uart_rx_line[uart_rx_length] = '\0';
+        uart_display_dirty = 1U;
+        while ((USART1->SR & (1U << 7)) == 0U) { }
+        USART1->DR = (uint8_t)ch;
+    }
+}
+
+/* Called from USART1_IRQHandler — RX via interrupt, not main-loop polling. */
+void UART_Rx_IRQHandler(void)
+{
+    uint32_t sr = USART1->SR;
+
+    if ((sr & USART_SR_RXNE) != 0U)
+    {
+        char ch = (char)(USART1->DR & 0xFFU);
+        UART_Rx_OnByte(ch);
+    }
+    else if ((sr & USART_SR_ORE) != 0U)
+    {
+        (void)USART1->DR;
+    }
+}
+
+static void UART_Process(void)
+{
+    if (uart_line_ready != 0U)
+    {
+        uart_line_ready = 0U;
+        UART_SendString("\r\n");
+        UartCmd_HandleLine(uart_rx_line);
+        uart_rx_length = 0U;
+        uart_display_dirty = 1U;
+        UART_SendString("> ");
+    }
 
     if ((screen_mode == 1U) && (menu_selection == 4) && uart_display_dirty)
     {
-        LCD_Update_UART_RX_Line();
+        LCD_Update_UART_Terminal();
         uart_display_dirty = 0U;
     }
+}
+
+static void Host_UartPwmSet(uint32_t freq_hz, uint8_t duty_percent, int8_t output_on)
+{
+    if (freq_hz < PWM_MIN_FREQUENCY_HZ)
+    {
+        freq_hz = PWM_MIN_FREQUENCY_HZ;
+    }
+    if (freq_hz > PWM_MAX_FREQUENCY_HZ)
+    {
+        freq_hz = PWM_MAX_FREQUENCY_HZ;
+    }
+    if (duty_percent > 100U)
+    {
+        duty_percent = 100U;
+    }
+
+    pwm_frequency_hz = freq_hz;
+    pwm_duty = duty_percent;
+    PwmGen_SetFrequencyHz(freq_hz);
+    PwmGen_SetDutyPercent(duty_percent);
+
+    if (output_on > 0)
+    {
+        PwmGen_Start();
+    }
+    else
+    {
+        PwmGen_Stop();
+    }
+    pwm_enabled = PwmGen_IsEnabled();
+}
+
+static uint8_t Host_UartEnvRead(float *temp_c, float *press_pa, float *humidity_rh)
+{
+    if (!bme280_initialized)
+    {
+        return 0U;
+    }
+    return BME280_ReadMeasurements(temp_c, press_pa, humidity_rh);
+}
+
+static void DcProbe_ServiceTick(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((screen_mode == 1U) && (menu_selection == 5))
+    {
+        DcProbe_Tick();
+        return;
+    }
+
+    if ((now - probe_slow_tick) >= 400U)
+    {
+        DcProbe_Tick();
+        probe_slow_tick = now;
+        if ((screen_mode == 0U) && ((now - probe_card_tick) >= 900U))
+        {
+            probe_card_tick = now;
+            Dashboard_DrawOneSelection(5, (uint8_t)(menu_selection == 5));
+        }
+    }
+}
+
+static void LCD_Update_Dc_Probe(void)
+{
+    DcProbe_Snapshot snap;
+    char line[40];
+    int32_t whole;
+    int32_t frac;
+
+    DcProbe_GetSnapshot(&snap);
+    if (snap.voltage_valid == 0U)
+    {
+        snprintf(line, sizeof(line), "VIN ---  PROBE OPEN");
+    }
+    else
+    {
+        whole = (int32_t)(snap.vin_mv / 1000U);
+        frac = (int32_t)((snap.vin_mv % 1000U) / 10U);
+        snprintf(line, sizeof(line), "VIN %ld.%02ld V",
+                 (long)whole, (long)frac);
+    }
+    LCD_Clear(12, 40, 296, 18, 0x10E5U);
+    LCD_SetTextColors(0xFFE0U, 0x10E5U);
+    LCD_DrawString(16, 44, line);
+
+    snprintf(line, sizeof(line), "RAW %u (%u-%u)",
+             (unsigned int)snap.raw_avg,
+             (unsigned int)snap.raw_min,
+             (unsigned int)snap.raw_max);
+    LCD_Clear(12, 62, 296, 18, 0x10E5U);
+    LCD_SetTextColors(0xE71CU, 0x10E5U);
+    LCD_DrawString(16, 66, line);
+
+    snprintf(line, sizeof(line), "VERDICT %s",
+             DcProbe_VerdictString(snap.verdict));
+    LCD_Clear(12, 84, 296, 18, 0x10E5U);
+    LCD_SetTextColors(0x07F0U, 0x10E5U);
+    LCD_DrawString(16, 88, line);
+
+    {
+        int32_t cal_milli = (int32_t)(snap.cal_factor * 1000.0f + 0.5f);
+        snprintf(line, sizeof(line), "CAL x %ld.%03ld",
+                 (long)(cal_milli / 1000), (long)(cal_milli % 1000));
+    }
+    LCD_Clear(12, 102, 296, 18, 0x10E5U);
+    LCD_SetTextColors(0x9CF3U, 0x10E5U);
+    LCD_DrawString(16, 106, line);
+
+    LCD_Clear(12, 120, 296, 40, 0x10E5U);
+    LCD_SetTextColors(0x9CF3U, 0x10E5U);
+    LCD_DrawString(16, 124, "DIVIDER 47K+12K");
+    LCD_DrawString(16, 144, "BLACK = TARGET GND");
+}
+
+static void LCD_Show_Dc_Probe(void)
+{
+    Screen_Begin("DC VOLTAGE PROBE");
+    LCD_Update_Dc_Probe();
+    Screen_Footer();
+    screen_mode = 1U;
 }
 
 /* =========================================================
@@ -756,12 +943,14 @@ static void Dashboard_DrawMain(void)
     char pwm_value[16];
     char signal_value[16];
     char env_value[16];
+    char probe_value[16];
+    DcProbe_Snapshot probe;
     uint16_t c_pwm = 0xFD20U;   /* amber */
     uint16_t c_signal = 0x07FFU;/* cyan */
     uint16_t c_i2c = 0xA75FU;   /* violet */
     uint16_t c_env = 0x07F0U;   /* green */
     uint16_t c_uart = 0xF81FU;  /* magenta */
-    uint16_t c_sys = 0x9CF3U;   /* muted blue-grey */
+    uint16_t c_probe = 0xFD40U; /* orange */
 
     snprintf(pwm_value, sizeof(pwm_value), "%u%% DUTY", (unsigned int)pwm_duty);
     if (Signal_Detected && Signal_Frequency_Hz > 0U)
@@ -769,6 +958,16 @@ static void Dashboard_DrawMain(void)
     else
         snprintf(signal_value, sizeof(signal_value), "NO SIGNAL");
     snprintf(env_value, sizeof(env_value), "%s", bme280_initialized ? "BME OK" : "BME CHECK");
+    DcProbe_GetSnapshot(&probe);
+    if (probe.voltage_valid == 0U)
+    {
+        snprintf(probe_value, sizeof(probe_value), "OPEN");
+    }
+    else
+    {
+        snprintf(probe_value, sizeof(probe_value), "%lu mV",
+                 (unsigned long)probe.vin_mv);
+    }
 
     LCD_Clear(0, 0, 320, 240, 0x0862U);
 
@@ -785,7 +984,7 @@ static void Dashboard_DrawMain(void)
     Dashboard_DrawCard(216, 42, 96, 78, c_i2c,    "I2C SCAN",  "2 FOUND",     "50 / 76",    menu_selection == 2);
     Dashboard_DrawCard(8,   128,96, 78, c_env,    "ENV",       env_value,     "BME280",     menu_selection == 3);
     Dashboard_DrawCard(112, 128,96, 78, c_uart,   "UART",      "115200",      "8-N-1",      menu_selection == 4);
-    Dashboard_DrawCard(216, 128,96, 78, c_sys,    "SYSTEM",    "72 MHZ",      "STM32F103",  menu_selection == 5);
+    Dashboard_DrawCard(216, 128,96, 78, c_probe,  "DC PROBE",  probe_value,   "ADC PC0",    menu_selection == 5);
 
     /* Footer */
     LCD_DrawLine(8, 216, 312, 216, 0x2945U);
@@ -824,11 +1023,25 @@ static void Dashboard_DrawOneSelection(int8_t selection, uint8_t selected)
             snprintf(value,sizeof(value),"%s",bme280_initialized?"BME OK":"BME CHECK"); detail="BME280"; break;
         case 4: x=112; y=128; accent=0xF81FU; title="UART";
             snprintf(value,sizeof(value),"115200"); detail="8-N-1"; break;
-        case 5: x=216; y=128; accent=0x9CF3U; title="SYSTEM";
-            snprintf(value,sizeof(value),"72 MHZ"); detail="STM32F103"; break;
+        case 5:
+        {
+            DcProbe_Snapshot ps;
+            x=216; y=128; accent=0xFD40U; title="DC PROBE";
+            DcProbe_GetSnapshot(&ps);
+            if (ps.voltage_valid == 0U)
+            {
+                snprintf(value, sizeof(value), "OPEN");
+            }
+            else
+            {
+                snprintf(value, sizeof(value), "%lu mV",
+                         (unsigned long)ps.vin_mv);
+            }
+            detail="ADC PC0"; break;
+        }
         default: return;
     }
-    Dashboard_DrawCard(x,y,96,78,accent,title,value,detail,selected);
+    Dashboard_DrawCard(x, y, 96, 78, accent, title, value, detail, selected);
 }
 
 static void LCD_Update_Menu_Selection(int8_t old_selection, int8_t new_selection)
@@ -882,27 +1095,9 @@ static void PWM_Draw_Settings(void)
 
 static void PWM_Draw_Waveform(void)
 {
-    uint16_t x0 = 28U, x1 = 292U, yTop = 199U, yLow = 211U, yHigh = 191U;
-    uint16_t highWidth = (uint16_t)(((uint32_t)(x1 - x0) * pwm_duty) / 100U);
-    uint16_t edge = (uint16_t)(x0 + highWidth);
-    LCD_Clear(16U, 188U, 288U, 28U, 0x10E5U);
-    LCD_SetTextColors(0x9CF3U, 0x10E5U);
-    LCD_DrawString(20U, 188U, "WAVEFORM");
-    if (!pwm_enabled || pwm_duty == 0U)
-    {
-        LCD_DrawLine(x0, yLow, x1, yLow, 0x07FFU);
-    }
-    else if (pwm_duty >= 100U)
-    {
-        LCD_DrawLine(x0, yHigh, x1, yHigh, 0x07FFU);
-    }
-    else
-    {
-        LCD_DrawLine(x0, yLow, x0, yHigh, 0x07FFU);
-        LCD_DrawLine(x0, yHigh, edge, yHigh, 0x07FFU);
-        LCD_DrawLine(edge, yHigh, edge, yLow, 0x07FFU);
-        LCD_DrawLine(edge, yLow, x1, yLow, 0x07FFU);
-    }
+    uint8_t have = (uint8_t)(pwm_enabled && (pwm_duty > 0U) && (pwm_duty < 100U));
+    Analyzer_DrawSineCycles(16U, 188U, 288U, 28U, "WAVEFORM", 0x07FFU,
+                          (uint32_t)pwm_duty, 2U, have);
 }
 
 static void LCD_Update_PWM_Display(void)
@@ -1282,12 +1477,8 @@ static void LCD_Show_Selected_Module(void)
             LCD_Show_UART_Terminal();
             return;
         case 5:
-            Screen_Begin("SYSTEM INFORMATION");
-            LCD_DrawString(16, 64, "STM32F103VET6");
-            LCD_DrawString(16, 100, "CLOCK: 72 MHZ");
-            LCD_DrawString(16, 136, "LCD: READY");
-            LCD_DrawString(16, 172, "ENCODER: READY");
-            break;
+            LCD_Show_Dc_Probe();
+            return;
         default:
             break;
     }
@@ -1365,6 +1556,10 @@ static void LCD_Handle_Menu(void)
     {
         LCD_Update_Signal_Analyzer();
         analyzer_last_refresh = HAL_GetTick();
+    }
+    if ((screen_mode == 1U) && (menu_selection == 5))
+    {
+        LCD_Update_Dc_Probe();
     }
 
     /* Short press event */

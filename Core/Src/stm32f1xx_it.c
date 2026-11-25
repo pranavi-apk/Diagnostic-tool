@@ -202,10 +202,16 @@ void SysTick_Handler(void)
 
 /* Implemented in main.c: processes TIM3 input-capture measurements. */
 extern void SignalAnalyzer_TIM3_IRQHandler(void);
+extern void UART_Rx_IRQHandler(void);
 
 void TIM3_IRQHandler(void)
 {
   SignalAnalyzer_TIM3_IRQHandler();
+}
+
+void USART1_IRQHandler(void)
+{
+  UART_Rx_IRQHandler();
 }
 
 /* USER CODE END 1 */
